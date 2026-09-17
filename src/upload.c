@@ -30,6 +30,7 @@ typedef struct {
     HWND hwnd, name, creator, custom, desc, pkg_btn, man_btn, img_btn, upload, cancel;
     int type;                         /* index into TYPES, -1 none */
     int hot_type;
+    int pressed_type;                 /* chip the left button went down on, -1 none */
     wchar_t files[3][MAX_PATH];       /* package, manifest, image */
     GpImage thumb;
     bool busy;
@@ -37,6 +38,9 @@ typedef struct {
     wchar_t phase[160];
     wchar_t status[600];
     COLORREF status_color;
+    /* editing an existing map instead of uploading a new one */
+    bool edit;
+    wchar_t edit_id[64], edit_token[128];
 } Upload;
 
 static Upload *g_up;
@@ -48,6 +52,8 @@ typedef struct {
     int64_t sizes[3], base;           /* base = bytes of earlier parts, for overall progress */
     uint64_t last_post;
     const wchar_t *phase;
+    bool edit;                        /* PATCH details (+ replace the image if files[2] is set) */
+    wchar_t id[64], token[128];
 } UploadJob;
 
 typedef struct { bool ok; wchar_t message[700]; wchar_t id[64]; wchar_t token[128]; } UploadResult;
@@ -113,7 +119,8 @@ static void paint_file_row(HDC dc, Upload *u, int i, int y, int h)
     RECT info = { dpi(text_left), dpi(y + h / 2 + 2), dpi(W_WIDTH - M - 130), dpi(y + h - 10) };
     if (!path[0]) {
         RECT r = { dpi(text_left), dpi(y), dpi(W_WIDTH - M - 130), dpi(y + h) };
-        text_at(dc, L"No file chosen", r, ui_font(14, FW_NORMAL), C_FAINT, DT_SINGLELINE | DT_VCENTER);
+        text_at(dc, u->edit ? L"Keep the current preview" : L"No file chosen", r, ui_font(14, FW_NORMAL), C_FAINT,
+                DT_SINGLELINE | DT_VCENTER);
         return;
     }
     const wchar_t *base = wcsrchr(path, L'\\');
@@ -142,10 +149,12 @@ static void paint(HWND h, Upload *u)
 
     gfx_fill_round(dc, dpi(M), dpi(26), dpi(6), dpi(40), dpi(3), ARGB(255, C_ACCENT2));
     RECT t = { dpi(M + 18), dpi(20), rc.right - dpi(M), dpi(48) };
-    text_at(dc, L"Upload a map", t, ui_font(24, FW_BOLD), C_TEXT, DT_SINGLELINE | DT_VCENTER);
+    text_at(dc, u->edit ? L"Edit map details" : L"Upload a map", t, ui_font(24, FW_BOLD), C_TEXT,
+            DT_SINGLELINE | DT_VCENTER);
     RECT st = { dpi(M + 18), dpi(48), rc.right - dpi(M), dpi(70) };
-    text_at(dc, L"Share your repacked map so anyone can install it with one click.", st, ui_font(13, FW_NORMAL),
-            C_MUTED, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    text_at(dc, u->edit ? L"Changes show for everyone as soon as you save."
+                        : L"Share your repacked map so anyone can install it with one click.",
+            st, ui_font(13, FW_NORMAL), C_MUTED, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 
     label(dc, L"Map name", NULL, row_y(0));
     field_box(dc, row_y(0) + 24, 42);
@@ -168,11 +177,24 @@ static void paint(HWND h, Upload *u)
     label(dc, L"Description", L"what it is, how to play it", row_y(3));
     field_box(dc, row_y(3) + 24, 112);
 
-    label(dc, L"Map package", PACKAGE_NAME L"  →  packages", row_y(4));
-    paint_file_row(dc, u, 0, row_y(4) + 24, 50);
-    label(dc, L"Manifest", MANIFEST_NAME L"  →  manifests", row_y(5));
-    paint_file_row(dc, u, 1, row_y(5) + 24, 50);
-    label(dc, L"Preview image", L"PNG or JPG screenshot from in game", row_y(6));
+    if (u->edit) {
+        /* the files are what people installed: changing them is a new map, not an edit */
+        label(dc, L"Map files", NULL, row_y(4));
+        int y = row_y(4) + 24, hgt = row_y(6) - 8 - y;
+        gfx_fill_round(dc, dpi(M), dpi(y), dpi(W_WIDTH - 2 * M), dpi(hgt), dpi(10), ARGB(255, RGB(24, 27, 38)));
+        gfx_stroke_round(dc, dpi(M), dpi(y), dpi(W_WIDTH - 2 * M), dpi(hgt), dpi(10), ARGB(255, C_BORDER), 1.0f);
+        RECT r = { dpi(M + 16), dpi(y), dpi(W_WIDTH - M - 16), dpi(y + hgt) };
+        text_at(dc, L"The package and manifest can't be changed after upload — people may already have them "
+                    L"installed. To ship new files, upload them as a new map.",
+                r, ui_font(13, FW_NORMAL), C_MUTED, DT_WORDBREAK | DT_VCENTER | DT_EDITCONTROL);
+    } else {
+        label(dc, L"Map package", PACKAGE_NAME L"  →  packages", row_y(4));
+        paint_file_row(dc, u, 0, row_y(4) + 24, 50);
+        label(dc, L"Manifest", MANIFEST_NAME L"  →  manifests", row_y(5));
+        paint_file_row(dc, u, 1, row_y(5) + 24, 50);
+    }
+    label(dc, L"Preview image", u->edit ? L"optional: choose one to replace the current preview"
+                                        : L"PNG or JPG screenshot from in game", row_y(6));
     paint_file_row(dc, u, 2, row_y(6) + 24, 64);
 
     /* progress + status above the buttons */
@@ -230,7 +252,7 @@ static void set_busy(Upload *u, bool busy)
     EnableWindow(u->man_btn, !busy);
     EnableWindow(u->img_btn, !busy);
     EnableWindow(u->upload, !busy);
-    SetWindowTextW(u->upload, busy ? L"Uploading…" : L"Upload Map");
+    SetWindowTextW(u->upload, u->edit ? (busy ? L"Saving…" : L"Save changes") : (busy ? L"Uploading…" : L"Upload Map"));
     InvalidateRect(u->hwnd, NULL, FALSE);
 }
 
@@ -299,6 +321,59 @@ static void header_lines(wchar_t *out, size_t cap, const wchar_t *type, const wc
         _snwprintf(out + n, cap - n, L"X-Upload-Key: %ls\r\n", key);
     }
     out[cap - 1] = 0;
+}
+
+/* edit mode: PATCH the details, then replace the preview if a new one was chosen */
+static DWORD WINAPI edit_thread(LPVOID arg)
+{
+    UploadJob *job = (UploadJob *)arg;
+    UploadResult *res = (UploadResult *)calloc(1, sizeof(UploadResult));
+    wchar_t url[700], headers[600], why[400] = L"";
+    NetResult r;
+
+    Buf body = {0};
+    buf_appendz(&body, "{\"name\":");
+    buf_json_string(&body, job->name);
+    buf_appendz(&body, ",\"creator\":");
+    buf_json_string(&body, job->creator);
+    buf_appendz(&body, ",\"gametype\":");
+    buf_json_string(&body, job->type);
+    buf_appendz(&body, ",\"description\":");
+    buf_json_string(&body, job->desc);
+    buf_appendz(&body, "}");
+    _snwprintf(url, 700, L"%ls/maps/%ls", job->server, job->id);
+    header_lines(headers, 600, L"application/json", job->token, NULL);
+    job->phase = L"Saving details…";
+    up_progress(job, 0, 0);
+    bool ok = net_request(L"PATCH", url, headers, body.data, body.len, &r);
+    buf_free(&body);
+    if (!ok) net_describe_error(&r, why, 400);
+    net_result_free(&r);
+
+    if (ok && job->files[2][0]) {
+        job->phase = L"Uploading new preview image…";
+        job->last_post = 0;
+        _snwprintf(url, 700, L"%ls/maps/%ls/image", job->server, job->id);
+        header_lines(headers, 600, L"application/octet-stream", job->token, NULL);
+        ok = net_upload(L"PUT", url, headers, job->files[2], up_progress, job, &r);
+        if (!ok) {
+            wchar_t e[300];
+            net_describe_error(&r, e, 300);
+            _snwprintf(why, 400, L"the details were saved, but the new image failed: %ls", e);
+        }
+        net_result_free(&r);
+    }
+
+    res->ok = ok;
+    _snwprintf(res->id, 64, L"%ls", job->id);
+    if (ok) _snwprintf(res->message, 700, L"“%ls” is updated.", job->name);
+    else _snwprintf(res->message, 700, L"Saving failed — %ls", why);
+    SecureZeroMemory(job->token, sizeof job->token);
+    free(job->name); free(job->creator); free(job->type); free(job->desc);
+    free(job);
+    HWND target = g_up ? g_up->hwnd : NULL;
+    if (!target || !PostMessageW(target, WM_APP_UPLOADED, 1, (LPARAM)res)) free(res);
+    return 0;
 }
 
 static DWORD WINAPI upload_thread(LPVOID arg)
@@ -426,9 +501,10 @@ static void start_upload(Upload *u)
     else if (!creator[0]) { problem = L"Add who made the map."; focus = u->creator; }
     else if (u->type < 0) problem = L"Pick a game type.";
     else if (!type[0]) { problem = L"Type the custom game type."; focus = u->custom; }
-    else if (!u->files[0][0] || !file_exists(u->files[0])) problem = L"Choose the map package file (" PACKAGE_NAME L").";
-    else if (!u->files[1][0] || !file_exists(u->files[1])) problem = L"Choose the manifest file (" MANIFEST_NAME L").";
-    else if (!u->files[2][0] || !file_exists(u->files[2])) problem = L"Choose a preview image.";
+    else if (!u->edit && (!u->files[0][0] || !file_exists(u->files[0]))) problem = L"Choose the map package file (" PACKAGE_NAME L").";
+    else if (!u->edit && (!u->files[1][0] || !file_exists(u->files[1]))) problem = L"Choose the manifest file (" MANIFEST_NAME L").";
+    else if (!u->edit && (!u->files[2][0] || !file_exists(u->files[2]))) problem = L"Choose a preview image.";
+    else if (u->edit && u->files[2][0] && !file_exists(u->files[2])) problem = L"The new preview image can't be found.";
     if (problem) {
         fail_field(u, problem, focus);
         free(name); free(creator); free(desc); free(type);
@@ -437,7 +513,7 @@ static void start_upload(Upload *u)
     const wchar_t *pb = wcsrchr(u->files[0], L'\\'), *mb = wcsrchr(u->files[1], L'\\');
     pb = pb ? pb + 1 : u->files[0];
     mb = mb ? mb + 1 : u->files[1];
-    if (_wcsicmp(pb, PACKAGE_NAME) || _wcsicmp(mb, MANIFEST_NAME)) {
+    if (!u->edit && (_wcsicmp(pb, PACKAGE_NAME) || _wcsicmp(mb, MANIFEST_NAME))) {
         wchar_t msg[700];
         _snwprintf(msg, 700, L"The files are usually named\n  %ls\n  %ls\n\nYou picked\n  %ls\n  %ls\n\n"
                              L"They are installed under the right names either way. Upload anyway?",
@@ -453,17 +529,22 @@ static void start_upload(Upload *u)
     _snwprintf(job->key, 256, L"%ls", g_cfg.upload_key);
     job->name = name; job->creator = creator; job->type = type; job->desc = desc;
     for (int i = 0; i < 3; i++) {
+        if (u->edit && i < 2) continue;             /* an edit never sends map files */
         wcscpy(job->files[i], u->files[i]);
-        job->sizes[i] = file_size(u->files[i]);
+        job->sizes[i] = u->files[i][0] ? file_size(u->files[i]) : 0;
+        if (job->sizes[i] < 0) job->sizes[i] = 0;
     }
+    job->edit = u->edit;
+    wcscpy(job->id, u->edit_id);
+    wcscpy(job->token, u->edit_token);
     u->done = 0;
     u->total = job->sizes[0] + job->sizes[1] + job->sizes[2];
     wcscpy(u->phase, L"Starting…");
     u->status[0] = 0;
-    HANDLE t = CreateThread(NULL, 0, upload_thread, job, 0, NULL);
+    HANDLE t = CreateThread(NULL, 0, u->edit ? edit_thread : upload_thread, job, 0, NULL);
     if (!t) {
         free(name); free(creator); free(desc); free(type); free(job);
-        fail_field(u, L"Could not start the upload.", NULL);
+        fail_field(u, u->edit ? L"Could not start saving." : L"Could not start the upload.", NULL);
         return;
     }
     CloseHandle(t);
@@ -535,12 +616,31 @@ static LRESULT CALLBACK upload_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT && (HWND)wp == h) return TRUE;
         break;
+    case WM_LBUTTONDOWN: {
+        int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+        u->pressed_type = -1;
+        for (int i = 0; i < NTYPES; i++) {
+            RECT r = chip_rect(i);
+            if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) u->pressed_type = i;
+        }
+        SetCapture(h);
+        return 0;
+    }
+    case WM_CAPTURECHANGED:
+        if ((HWND)lp != h) u->pressed_type = -1;
+        return 0;
     case WM_LBUTTONUP: {
-        if (u->busy) return 0;
+        if (GetCapture() == h) ReleaseCapture();
+        /* ⛔ Only a click that also STARTED on the chip. Double-clicking a file in the Browse
+           dialog closes it on the second press, and that press's button-up then arrives here
+           -- it landed on "Social" and silently replaced the type that had been picked. */
+        int pressed = u->pressed_type;
+        u->pressed_type = -1;
+        if (u->busy || pressed < 0) return 0;
         int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
         for (int i = 0; i < NTYPES; i++) {
             RECT r = chip_rect(i);
-            if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) {
+            if (i == pressed && x >= r.left && x < r.right && y >= r.top && y < r.bottom) {
                 u->type = i;
                 ShowWindow(u->custom, i == NTYPES - 1 ? SW_SHOW : SW_HIDE);
                 if (i == NTYPES - 1) SetFocus(u->custom);
@@ -564,7 +664,7 @@ static LRESULT CALLBACK upload_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         if (r->ok) {
             wchar_t id[64];
             wcscpy(id, r->id);
-            uploads_remember(r->id, r->token);     /* what lets this PC remove the map later */
+            if (!wp) uploads_remember(r->id, r->token);   /* a new upload: lets this PC edit/remove it later */
             MessageBoxW(h, r->message, APP_NAME, MB_ICONINFORMATION);
             free(r);
             DestroyWindow(h);
@@ -615,15 +715,15 @@ bool upload_register(HINSTANCE inst)
 
 HWND upload_window(void) { return g_up ? g_up->hwnd : NULL; }
 
-void upload_open(HWND owner)
+static HWND open_window(HWND owner, Upload *u)
 {
     if (g_up) {
         SetForegroundWindow(g_up->hwnd);
-        return;
+        free(u);
+        return NULL;
     }
-    Upload *u = (Upload *)calloc(1, sizeof(Upload));
-    u->type = -1;
     u->hot_type = -1;
+    u->pressed_type = -1;
     g_up = u;
     RECT o;
     GetWindowRect(owner, &o);
@@ -634,13 +734,56 @@ void upload_open(HWND owner)
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     int x = o.left + (o.right - o.left - ww) / 2, y = o.top + (o.bottom - o.top - wh) / 2;
     if (y < work.top) y = work.top;
-    HWND h = CreateWindowExW(0, L"MapTesterUpload", L"Upload Map — " APP_NAME,
+    HWND h = CreateWindowExW(0, L"MapTesterUpload", u->edit ? L"Edit Map — " APP_NAME : L"Upload Map — " APP_NAME,
                              WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN, x, y, ww, wh, owner, NULL, g_inst, u);
     if (!h) {
         free(u);
         g_up = NULL;
-        return;
+        return NULL;
     }
+    return h;
+}
+
+void upload_open(HWND owner)
+{
+    Upload *u = (Upload *)calloc(1, sizeof(Upload));
+    u->type = -1;
+    HWND h = open_window(owner, u);
+    if (!h) return;
+    EnableWindow(owner, FALSE);
+    ShowWindow(h, SW_SHOW);
+}
+
+void upload_open_edit(HWND owner, const MapEditInit *init)
+{
+    Upload *u = (Upload *)calloc(1, sizeof(Upload));
+    u->type = -1;
+    u->edit = true;
+    _snwprintf(u->edit_id, 64, L"%ls", init->id);
+    _snwprintf(u->edit_token, 128, L"%ls", init->token);
+    HWND h = open_window(owner, u);
+    if (!h) return;
+    SetWindowTextW(u->name, init->name);
+    SetWindowTextW(u->creator, init->creator);
+    /* the server keeps LF; an edit control only breaks lines on CRLF */
+    size_t n = wcslen(init->description);
+    wchar_t *desc = (wchar_t *)calloc(n * 2 + 1, sizeof(wchar_t));
+    for (size_t i = 0, k = 0; i < n; i++) {
+        if (init->description[i] == L'\n' && (i == 0 || init->description[i - 1] != L'\r')) desc[k++] = L'\r';
+        desc[k++] = init->description[i];
+    }
+    SetWindowTextW(u->desc, desc);
+    free(desc);
+    for (int i = 0; i < NTYPES - 1; i++)
+        if (!_wcsicmp(init->gametype, TYPES[i])) u->type = i;
+    if (u->type < 0 && init->gametype[0]) {
+        u->type = NTYPES - 1;
+        SetWindowTextW(u->custom, init->gametype);
+        ShowWindow(u->custom, SW_SHOW);
+    }
+    ShowWindow(u->pkg_btn, SW_HIDE);
+    ShowWindow(u->man_btn, SW_HIDE);
+    SetWindowTextW(u->upload, L"Save changes");
     EnableWindow(owner, FALSE);
     ShowWindow(h, SW_SHOW);
 }

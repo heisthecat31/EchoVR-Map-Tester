@@ -24,7 +24,9 @@
 #define APP_NAME        L"Map Tester"
 #define APP_VERSION     L"1.0.0"
 /* Where Spark-Bot runs. Every copy of the app uses this server; it is not a setting. */
+#ifndef DEFAULT_SERVER   /* a test build may point elsewhere with -DDEFAULT_SERVER=... */
 #define DEFAULT_SERVER  L"https://spark-bot-production-0645.up.railway.app"
+#endif
 
 #define ECHO_DATA_REL   L"_data\\5932408047\\rad15\\win10"
 #define PACKAGE_NAME    L"48037dc70b0ecab2_3"
@@ -177,6 +179,9 @@ void select_map_by_id(const wchar_t *id);
 
 /* ── upload.c ───────────────────────────────────────────────────────────── */
 void upload_open(HWND owner);
+typedef struct { const wchar_t *id, *token, *name, *creator, *gametype, *description; } MapEditInit;
+/* the same window, prefilled, saving with PATCH (and a new preview if one is chosen) */
+void upload_open_edit(HWND owner, const MapEditInit *init);
 bool upload_register(HINSTANCE inst);
 HWND upload_window(void);   /* the open upload window, or NULL */
 

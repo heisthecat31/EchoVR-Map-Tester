@@ -36,6 +36,8 @@ typedef struct {
     GpImage image;
     int image_state;                 /* 0 not asked, 1 loading, 2 ready, 3 none */
     bool owned;                      /* uploaded from this PC, so it can be removed from here */
+    /* preview cache file name: id + the image's hash, so an edited preview is fetched again */
+    wchar_t cache_key[64];
 } MapItem;
 
 typedef struct { MapItem *items; int count; } MapList;
@@ -71,14 +73,17 @@ static wchar_t g_installed_label[256] = L"…";
 static InstallState g_installed_state = STATE_NO_ECHO;
 
 /* ── hover / hit testing ─────────────────────────────────────────────── */
-typedef enum { HIT_NONE, HIT_CARD, HIT_UPLOAD, HIT_INSTALL, HIT_SETTINGS, HIT_REFRESH, HIT_RETRY, HIT_PILL, HIT_REMOVE } Hit;
+typedef enum { HIT_NONE, HIT_CARD, HIT_UPLOAD, HIT_INSTALL, HIT_SETTINGS, HIT_REFRESH, HIT_RETRY, HIT_PILL, HIT_REMOVE, HIT_EDIT } Hit;
 static Hit g_hot = HIT_NONE;
 static int g_hot_card = -1;
 static bool g_tracking;
+/* what the left button went down on -- a click needs both halves on the same target */
+static Hit g_press_hit = HIT_NONE;
+static int g_press_card = -1;
 
 typedef struct {
     RECT header, side, list, upload, refresh, settings, pill;
-    RECT main, title, meta, desc, image, install, status, retry, remove;
+    RECT main, title, meta, desc, image, install, status, retry, remove, edit;
 } Layout;
 
 /* ── fonts ───────────────────────────────────────────────────────────── */
@@ -182,6 +187,15 @@ static MapList *parse_maps(const char *text, wchar_t *err, size_t cap)
         m->description = utf8_to_wide(json_str(o, "description", ""));
         m->pkg_size = (int64_t)json_num(o, "package_size", 0);
         m->man_size = (int64_t)json_num(o, "manifest_size", 0);
+        const char *img = json_str(o, "image_sha256", "");
+        char tag[13] = "";
+        size_t t = 0;
+        while (t < 12 && ((img[t] >= '0' && img[t] <= '9') || (img[t] >= 'a' && img[t] <= 'f'))) {
+            tag[t] = img[t];
+            t++;
+        }
+        tag[t] = 0;
+        _snwprintf(m->cache_key, 64, t ? L"%ls_%hs" : L"%ls", m->id, tag);
         snprintf(m->pkg_sha, 65, "%s", json_str(o, "package_sha256", ""));
         snprintf(m->man_sha, 65, "%s", json_str(o, "manifest_sha256", ""));
     }
@@ -228,23 +242,23 @@ void select_map_by_id(const wchar_t *id)
 }
 
 /* ── preview images ──────────────────────────────────────────────────── */
-static void cache_path(const wchar_t *id, wchar_t *out, size_t cap)
+static void cache_path(const wchar_t *key, wchar_t *out, size_t cap)
 {
     wchar_t dir[MAX_PATH];
     local_data_dir(L"cache", dir, MAX_PATH);
     wchar_t name[80];
-    _snwprintf(name, 80, L"%ls.img", id);
+    _snwprintf(name, 80, L"%ls.img", key);
     path_join(out, cap, dir, name);
 }
 
-typedef struct { wchar_t server[512], id[64]; } ImageJob;
+typedef struct { wchar_t server[512], id[64], key[64]; } ImageJob;
 
 static DWORD WINAPI fetch_image_thread(LPVOID arg)
 {
     ImageJob *job = (ImageJob *)arg;
     wchar_t url[700], dest[MAX_PATH], part[MAX_PATH];
     _snwprintf(url, 700, L"%ls/maps/%ls/image", job->server, job->id);
-    cache_path(job->id, dest, MAX_PATH);
+    cache_path(job->key, dest, MAX_PATH);
     _snwprintf(part, MAX_PATH, L"%ls.part", dest);
     NetResult r;
     bool ok = net_download(url, part, NULL, NULL, NULL, &r) &&
@@ -263,7 +277,7 @@ static void ensure_image(int index)
     MapItem *m = &g_maps.items[index];
     if (m->image_state != 0) return;
     wchar_t path[MAX_PATH];
-    cache_path(m->id, path, MAX_PATH);
+    cache_path(m->cache_key, path, MAX_PATH);
     if (file_exists(path) && (m->image = gfx_load_image(path)) != NULL) {
         m->image_state = 2;
         return;
@@ -272,6 +286,7 @@ static void ensure_image(int index)
     ImageJob *job = (ImageJob *)calloc(1, sizeof(ImageJob));
     _snwprintf(job->server, 512, L"%ls", g_cfg.server);
     _snwprintf(job->id, 64, L"%ls", m->id);
+    _snwprintf(job->key, 64, L"%ls", m->cache_key);
     HANDLE t = CreateThread(NULL, 0, fetch_image_thread, job, 0, NULL);
     if (t) CloseHandle(t); else { free(job); m->image_state = 3; }
 }
@@ -646,6 +661,21 @@ static DWORD WINAPI remove_thread(LPVOID arg)
     return 0;
 }
 
+static void do_edit(void)
+{
+    if (g_sel < 0 || g_sel >= g_maps.count) return;
+    MapItem *m = &g_maps.items[g_sel];
+    wchar_t token[128];
+    if (!uploads_token(m->id, token, 128)) {
+        m->owned = false;
+        InvalidateRect(g_main, NULL, FALSE);
+        return;
+    }
+    MapEditInit init = { m->id, token, m->name, m->creator, m->gametype, m->description };
+    upload_open_edit(g_main, &init);
+    SecureZeroMemory(token, sizeof token);
+}
+
 static void do_remove(void)
 {
     if (g_sel < 0 || g_sel >= g_maps.count) return;
@@ -736,7 +766,10 @@ static void compute_layout(HWND h, HDC dc, Layout *L)
     SetRect(&L->title, L->main.left, L->main.top, L->main.right, L->main.top + dpi(40));
     SetRect(&L->meta, L->main.left, L->title.bottom + dpi(4), L->main.right, L->title.bottom + dpi(32));
     if (m->owned)   /* right end of the meta row, only on maps uploaded from this PC */
+    {
         SetRect(&L->remove, L->meta.right - dpi(132), L->meta.top - dpi(2), L->meta.right, L->meta.bottom + dpi(2));
+        SetRect(&L->edit, L->remove.left - dpi(10) - dpi(122), L->remove.top, L->remove.left - dpi(10), L->remove.bottom);
+    }
     RECT d = { L->main.left, L->meta.bottom + dpi(10), L->main.right, L->meta.bottom + dpi(10) };
     if (m->description[0]) {
         HGDIOBJ old = SelectObject(dc, ui_font(15, FW_NORMAL));
@@ -956,7 +989,7 @@ static void paint_main(HDC dc, const Layout *L)
     wchar_t size[32], meta[400];
     format_size(m->pkg_size + m->man_size, size, 32);
     _snwprintf(meta, 400, L"by %ls     ·     %ls download", m->creator, size);
-    RECT mr = { pill.right + dpi(14), L->meta.top, m->owned ? L->remove.left - dpi(12) : L->meta.right, L->meta.bottom };
+    RECT mr = { pill.right + dpi(14), L->meta.top, m->owned ? L->edit.left - dpi(12) : L->meta.right, L->meta.bottom };
     draw_text(dc, meta, mr, ui_font(14, FW_NORMAL), C_MUTED, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 
     if (m->owned) {
@@ -972,6 +1005,19 @@ static void paint_main(HDC dc, const Layout *L)
         draw_text(dc, L"\xE74D", ir, icon_font(13), C_BAD, DT_SINGLELINE | DT_VCENTER);
         RECT lr = { ir.right + dpi(8), rb->top, rb->right, rb->bottom };
         draw_text(dc, L"Remove map", lr, ui_font(14, FW_SEMIBOLD), hot ? C_TEXT : RGB(255, 150, 150), DT_SINGLELINE | DT_VCENTER);
+
+        const RECT *eb = &L->edit;
+        bool ehot = g_hot == HIT_EDIT;
+        int ew = eb->right - eb->left, eh = eb->bottom - eb->top;
+        gfx_fill_round(dc, eb->left, eb->top, ew, eh, dpi(10), ARGB(255, ehot ? C_CARD_HOT : C_CARD));
+        gfx_stroke_round(dc, eb->left, eb->top, ew, eh, dpi(10), ARGB(255, ehot ? C_ACCENT2 : C_BORDER), 1.0f);
+        int eiw = text_width(dc, L"\xE70F", icon_font(13));
+        int elw = text_width(dc, L"Edit details", ui_font(14, FW_SEMIBOLD));
+        int ex0 = eb->left + (ew - eiw - dpi(8) - elw) / 2;
+        RECT eir = { ex0, eb->top, ex0 + eiw, eb->bottom };
+        draw_text(dc, L"\xE70F", eir, icon_font(13), C_ACCENT2, DT_SINGLELINE | DT_VCENTER);
+        RECT elr = { eir.right + dpi(8), eb->top, eb->right, eb->bottom };
+        draw_text(dc, L"Edit details", elr, ui_font(14, FW_SEMIBOLD), C_TEXT, DT_SINGLELINE | DT_VCENTER);
     }
 
     if (m->description[0])
@@ -1075,6 +1121,7 @@ static Hit hit_test(int x, int y, int *card)
     if (g_list_state == LIST_ERROR && g_sel < 0 && in_rect(&L.retry, x, y)) return HIT_RETRY;
     if (g_sel >= 0 && in_rect(&L.install, x, y)) return HIT_INSTALL;
     if (g_sel >= 0 && g_maps.items[g_sel].owned && in_rect(&L.remove, x, y)) return HIT_REMOVE;
+    if (g_sel >= 0 && g_maps.items[g_sel].owned && in_rect(&L.edit, x, y)) return HIT_EDIT;
     return HIT_NONE;
 }
 
@@ -1171,6 +1218,7 @@ static void on_click(int x, int y)
     case HIT_REFRESH: refresh_maps(); break;
     case HIT_PILL: do_revert(); break;
     case HIT_REMOVE: do_remove(); break;
+    case HIT_EDIT: do_edit(); break;
     case HIT_RETRY: refresh_maps(); break;
     case HIT_INSTALL:
         if (g_job.busy) {
@@ -1252,7 +1300,8 @@ static LRESULT CALLBACK main_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             MapItem *m = &g_maps.items[i];
             if (wcscmp(m->id, id)) continue;
             wchar_t path[MAX_PATH];
-            cache_path(m->id, path, MAX_PATH);
+            cache_path(m->cache_key, path, MAX_PATH);
+            gfx_free_image(m->image);
             m->image = wp ? gfx_load_image(path) : NULL;
             m->image_state = m->image ? 2 : 3;
         }
@@ -1353,8 +1402,25 @@ static LRESULT CALLBACK main_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT) return TRUE;   /* WM_MOUSEMOVE picks the cursor */
         break;
-    case WM_LBUTTONUP:
-        on_click(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+    case WM_LBUTTONDOWN:
+        g_press_hit = hit_test(GET_X_LPARAM(lp), GET_Y_LPARAM(lp), &g_press_card);
+        SetCapture(h);
+        return 0;
+    case WM_LBUTTONUP: {
+        /* Act only on a click that also STARTED here. Closing a dialog with a double-click
+           delivers the second button-up to whatever window is under the cursor. */
+        if (GetCapture() == h) ReleaseCapture();
+        Hit pressed = g_press_hit;
+        int pressed_card = g_press_card;
+        g_press_hit = HIT_NONE;
+        int card;
+        Hit hit = hit_test(GET_X_LPARAM(lp), GET_Y_LPARAM(lp), &card);
+        if (hit != HIT_NONE && hit == pressed && card == pressed_card)
+            on_click(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+        return 0;
+    }
+    case WM_CAPTURECHANGED:
+        if ((HWND)lp != h) g_press_hit = HIT_NONE;
         return 0;
     case WM_MOUSEWHEEL:
         g_scroll -= GET_WHEEL_DELTA_WPARAM(wp) * dpi(CARD_H) / WHEEL_DELTA;
