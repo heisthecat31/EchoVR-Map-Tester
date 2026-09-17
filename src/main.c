@@ -1409,10 +1409,12 @@ static LRESULT CALLBACK main_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     case WM_LBUTTONUP: {
         /* Act only on a click that also STARTED here. Closing a dialog with a double-click
            delivers the second button-up to whatever window is under the cursor. */
-        if (GetCapture() == h) ReleaseCapture();
+        /* read the press BEFORE releasing capture: ReleaseCapture sends WM_CAPTURECHANGED
+           synchronously, which clears it -- done the other way round, every click was dropped */
         Hit pressed = g_press_hit;
         int pressed_card = g_press_card;
         g_press_hit = HIT_NONE;
+        if (GetCapture() == h) ReleaseCapture();
         int card;
         Hit hit = hit_test(GET_X_LPARAM(lp), GET_Y_LPARAM(lp), &card);
         if (hit != HIT_NONE && hit == pressed && card == pressed_card)

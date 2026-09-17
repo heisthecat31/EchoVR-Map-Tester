@@ -630,12 +630,13 @@ static LRESULT CALLBACK upload_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         if ((HWND)lp != h) u->pressed_type = -1;
         return 0;
     case WM_LBUTTONUP: {
-        if (GetCapture() == h) ReleaseCapture();
         /* ⛔ Only a click that also STARTED on the chip. Double-clicking a file in the Browse
            dialog closes it on the second press, and that press's button-up then arrives here
-           -- it landed on "Social" and silently replaced the type that had been picked. */
+           -- it landed on "Social" and silently replaced the type that had been picked.
+           The press is read before ReleaseCapture, whose WM_CAPTURECHANGED clears it. */
         int pressed = u->pressed_type;
         u->pressed_type = -1;
+        if (GetCapture() == h) ReleaseCapture();
         if (u->busy || pressed < 0) return 0;
         int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
         for (int i = 0; i < NTYPES; i++) {
